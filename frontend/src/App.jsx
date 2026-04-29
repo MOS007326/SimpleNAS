@@ -4,12 +4,45 @@ function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [disks, setDisks] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [password, setPassword] = useState('');
+  
+  const [sysStats, setSysStats] = useState(null);
+  const [storageStats, setStorageStats] = useState(null);
 
   useEffect(() => {
     if (activeTab === 'storage') {
       fetchDisks();
     }
+    if (activeTab === 'dashboard') {
+      fetchDashboardStats();
+      const interval = setInterval(fetchDashboardStats, 2000);
+      return () => clearInterval(interval);
+    }
   }, [activeTab]);
+
+  const fetchDashboardStats = async () => {
+    try {
+      const [statsRes, storageRes] = await Promise.all([
+        fetch(`http://${window.location.hostname}:3001/api/system/stats`),
+        fetch(`http://${window.location.hostname}:3001/api/system/storage`)
+      ]);
+      const statsData = await statsRes.json();
+      const storageData = await storageRes.json();
+      
+      if (statsData.success) setSysStats(statsData);
+      if (storageData.success) setStorageStats(storageData);
+    } catch (e) {
+      console.error("Error fetching stats", e);
+    }
+  };
+
+  const formatBytes = (bytes) => {
+    if (!bytes || bytes === 0) return '0 GB';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
 
   const fetchDisks = async () => {
     setLoading(true);
@@ -24,6 +57,54 @@ function App() {
       console.error("Failed to fetch disks", error);
     }
     setLoading(false);
+  };
+
+  const handleFormat = async (diskName) => {
+    if (!window.confirm(`WARNING: Are you sure you want to format /dev/${diskName}?\n\nALL DATA ON THIS DRIVE WILL BE PERMANENTLY ERASED!`)) {
+      return;
+    }
+    
+    try {
+      const res = await fetch(`http://${window.location.hostname}:3001/api/disks/format`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ disk: diskName })
+      });
+      const data = await res.json();
+      if (data.success) {
+        alert(data.message);
+        fetchDisks(); // Refresh the disk list
+      } else {
+        alert('Format failed: ' + data.error);
+      }
+    } catch (error) {
+      console.error("Format error", error);
+      alert('An error occurred while formatting.');
+    }
+  };
+
+  const handleParity = async (diskName) => {
+    if (!window.confirm(`WARNING: Are you sure you want to format /dev/${diskName} as the PARITY drive?\n\nALL DATA ON THIS DRIVE WILL BE PERMANENTLY ERASED!`)) {
+      return;
+    }
+    
+    try {
+      const res = await fetch(`http://${window.location.hostname}:3001/api/disks/parity`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ disk: diskName })
+      });
+      const data = await res.json();
+      if (data.success) {
+        alert(data.message);
+        fetchDisks(); // Refresh the disk list
+      } else {
+        alert('Parity setup failed: ' + data.error);
+      }
+    } catch (error) {
+      console.error("Parity setup error", error);
+      alert('An error occurred while setting up parity.');
+    }
   };
 
   return (
@@ -67,30 +148,63 @@ function App() {
             </div>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6 backdrop-blur-sm">
-                <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider">Pool Status</h3>
+                <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider">CPU Usage</h3>
                 <div className="mt-2 flex items-baseline gap-2">
-                  <span className="text-3xl font-bold text-emerald-400">Online</span>
+                  <span className="text-3xl font-bold text-emerald-400">
+                    {sysStats ? sysStats.cpu.toFixed(1) : '0'}%
+                  </span>
                 </div>
-                <p className="text-sm text-slate-500 mt-2">MergerFS pool is healthy.</p>
+                <div className="w-full bg-slate-700/50 rounded-full h-2 mt-4 overflow-hidden">
+                  <div className="bg-emerald-500 h-2 rounded-full transition-all duration-500" style={{width: `${sysStats?.cpu || 0}%`}}></div>
+                </div>
               </div>
               <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6 backdrop-blur-sm">
-                <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider">Data Protection</h3>
+                <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider">Memory (RAM)</h3>
                 <div className="mt-2 flex items-baseline gap-2">
-                  <span className="text-3xl font-bold text-amber-400">Unconfigured</span>
+                  <span className="text-3xl font-bold text-amber-400">
+                    {sysStats ? sysStats.memory.percent.toFixed(1) : '0'}%
+                  </span>
+                  <span className="text-sm text-slate-500">
+                    {sysStats ? formatBytes(sysStats.memory.used) : '0 GB'}
+                  </span>
                 </div>
-                <p className="text-sm text-slate-500 mt-2">SnapRAID is not set up yet.</p>
+                <div className="w-full bg-slate-700/50 rounded-full h-2 mt-4 overflow-hidden">
+                  <div className="bg-amber-500 h-2 rounded-full transition-all duration-500" style={{width: `${sysStats?.memory.percent || 0}%`}}></div>
+                </div>
               </div>
               <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6 backdrop-blur-sm">
                 <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider">Storage Capacity</h3>
                 <div className="mt-2 flex items-baseline gap-2">
-                  <span className="text-3xl font-bold text-slate-200">0 GB</span>
-                  <span className="text-sm font-medium text-slate-500">/ 0 GB</span>
+                  <span className="text-3xl font-bold text-slate-200">
+                    {storageStats ? formatBytes(storageStats.used) : '0 GB'}
+                  </span>
+                  <span className="text-sm font-medium text-slate-500">
+                    / {storageStats ? formatBytes(storageStats.total) : '0 GB'}
+                  </span>
                 </div>
                 <div className="w-full bg-slate-700/50 rounded-full h-2 mt-4 overflow-hidden">
-                  <div className="bg-gradient-to-r from-indigo-500 to-purple-500 h-2 rounded-full w-0"></div>
+                  <div className="bg-gradient-to-r from-indigo-500 to-purple-500 h-2 rounded-full transition-all duration-500" style={{width: `${storageStats?.use || 0}%`}}></div>
                 </div>
               </div>
             </div>
+            
+            {/* Extended Stats */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6">
+                 <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-4">Network Activity</h3>
+                 <div className="flex justify-around">
+                    <div className="text-center">
+                      <div className="text-2xl font-bold text-blue-400">{sysStats ? formatBytes(sysStats.network.rx_sec) : '0 B'}/s</div>
+                      <div className="text-xs text-slate-500 uppercase mt-1">Download</div>
+                    </div>
+                    <div className="text-center">
+                      <div className="text-2xl font-bold text-purple-400">{sysStats ? formatBytes(sysStats.network.tx_sec) : '0 B'}/s</div>
+                      <div className="text-xs text-slate-500 uppercase mt-1">Upload</div>
+                    </div>
+                 </div>
+              </div>
+            </div>
+
           </div>
         )}
 
@@ -121,21 +235,43 @@ function App() {
                     // Check if it's the OS drive (has a partition mounted at / or /boot)
                     const isOS = disk.children?.some(part => part.mountpoints?.includes('/'));
                     
+                    // Check if it's mounted in the pool
+                    const isInPool = disk.children?.some(part => part.mountpoints?.some(mp => mp?.startsWith('/mnt/disk_')));
+                    
+                    // Check if it's a parity drive
+                    const isParity = disk.children?.some(part => part.mountpoints?.some(mp => mp?.startsWith('/mnt/parity_')));
+
                     return (
                       <div key={disk.name} className="p-6 flex items-center justify-between hover:bg-slate-800/80 transition-colors">
                         <div className="flex items-center gap-4">
-                          <div className={`w-12 h-12 rounded-lg flex items-center justify-center text-xl shadow-inner ${isOS ? 'bg-slate-800 text-slate-500 border border-slate-700' : 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20'}`}>
+                          <div className={`w-12 h-12 rounded-lg flex items-center justify-center text-xl shadow-inner ${isOS ? 'bg-slate-800 text-slate-500 border border-slate-700' : isParity ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' : isInPool ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20'}`}>
                             🖴
                           </div>
                           <div>
                             <h3 className="font-semibold text-lg flex items-center gap-2">
                               {disk.name}
                               {isOS && <span className="text-[10px] uppercase tracking-wider bg-slate-700 text-slate-300 px-2 py-0.5 rounded-full">OS Drive</span>}
+                              {isInPool && <span className="text-[10px] uppercase tracking-wider bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded-full">In Pool</span>}
+                              {isParity && <span className="text-[10px] uppercase tracking-wider bg-amber-500/20 text-amber-400 border border-amber-500/30 px-2 py-0.5 rounded-full">Parity</span>}
                             </h3>
                             <p className="text-sm text-slate-400 flex gap-3">
                               <span>{disk.size}</span>
                               <span>•</span>
                               <span>{disk.model || 'Unknown Model'}</span>
+                              {disk.temperature && disk.temperature !== 'Unknown' && (
+                                <>
+                                  <span>•</span>
+                                  <span className="text-rose-400">{disk.temperature}°C</span>
+                                </>
+                              )}
+                              {disk.health && disk.health !== 'Unknown' && (
+                                <>
+                                  <span>•</span>
+                                  <span className={disk.health === 'passed' ? 'text-emerald-400' : 'text-rose-400'}>
+                                    SMART: {disk.health.toUpperCase()}
+                                  </span>
+                                </>
+                              )}
                             </p>
                           </div>
                         </div>
@@ -144,12 +280,26 @@ function App() {
                             <button disabled className="px-4 py-2 bg-slate-800/50 text-slate-500 rounded-lg text-sm font-medium cursor-not-allowed">
                               System Drive (Locked)
                             </button>
+                          ) : isInPool ? (
+                             <button disabled className="px-4 py-2 bg-emerald-500/5 text-emerald-500/50 border border-emerald-500/10 rounded-lg text-sm font-medium cursor-not-allowed flex items-center gap-2">
+                                ✓ Data Pool
+                             </button>
+                          ) : isParity ? (
+                             <button disabled className="px-4 py-2 bg-amber-500/5 text-amber-500/50 border border-amber-500/10 rounded-lg text-sm font-medium cursor-not-allowed flex items-center gap-2">
+                                ✓ Parity Drive
+                             </button>
                           ) : (
                             <>
-                              <button className="px-4 py-2 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 rounded-lg text-sm font-medium transition-colors">
+                              <button 
+                                onClick={() => handleFormat(disk.name)}
+                                className="px-4 py-2 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 rounded-lg text-sm font-medium transition-colors"
+                              >
                                 Add to Data Pool
                               </button>
-                              <button className="px-4 py-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 rounded-lg text-sm font-medium transition-colors">
+                              <button 
+                                onClick={() => handleParity(disk.name)}
+                                className="px-4 py-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 rounded-lg text-sm font-medium transition-colors"
+                              >
                                 Set as Parity
                               </button>
                             </>
@@ -160,6 +310,106 @@ function App() {
                   })}
                 </div>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* Shares Tab */}
+        {activeTab === 'shares' && (
+          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+             <div className="flex justify-between items-end">
+              <div>
+                <h2 className="text-2xl font-bold tracking-tight">Network Shares (Samba)</h2>
+                <p className="text-slate-400 mt-1">Manage folders shared over the network to your Windows PC.</p>
+              </div>
+            </div>
+
+            <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl overflow-hidden p-8 text-center">
+                <div className="w-16 h-16 bg-indigo-500/10 text-indigo-400 rounded-2xl flex items-center justify-center text-3xl mx-auto mb-4 border border-indigo-500/20">
+                  📁
+                </div>
+                <h3 className="text-xl font-bold mb-2">SimpleNAS Main Pool</h3>
+                <p className="text-slate-400 mb-6 max-w-md mx-auto">
+                  This will expose your entire MergerFS storage pool to your local network.
+                </p>
+
+                <div className="max-w-xs mx-auto space-y-4 mb-6">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-1 text-left">Network Username</label>
+                    <input type="text" disabled value="simplenas" className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-slate-500 cursor-not-allowed" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-1 text-left">Network Password</label>
+                    <input 
+                      type="password" 
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="Enter a secure password..."
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-slate-200 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex gap-4 justify-center">
+                  <button 
+                    onClick={async () => {
+                      setLoading(true);
+                      try {
+                        const res = await fetch(`http://${window.location.hostname}:3001/api/shares/enable`, { method: 'POST' });
+                        const data = await res.json();
+                        if (data.success) {
+                          alert("Network Share Enabled! (Public Access)");
+                        } else {
+                          alert("Failed: " + data.error);
+                        }
+                      } catch(e) {
+                        alert("Error enabling share.");
+                      }
+                      setLoading(false);
+                    }}
+                    className="px-6 py-3 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg font-medium transition-all active:scale-95"
+                  >
+                    Enable (Public)
+                  </button>
+                  <button 
+                    onClick={async () => {
+                      if (!password || password.length < 4) {
+                        alert("Please enter a password of at least 4 characters.");
+                        return;
+                      }
+                      setLoading(true);
+                      try {
+                        const res = await fetch(`http://${window.location.hostname}:3001/api/shares/credentials`, { 
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ password })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                          alert(data.message + "\n\nYou can now access \\\\" + window.location.hostname + "\\SimpleNAS_Pool using these credentials.");
+                        } else {
+                          alert("Failed: " + data.error);
+                        }
+                      } catch(e) {
+                        alert("Error setting security.");
+                      }
+                      setLoading(false);
+                    }}
+                    className="px-6 py-3 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg font-medium shadow-lg shadow-indigo-500/20 transition-all active:scale-95 flex items-center gap-2"
+                  >
+                    🔒 Set Password & Enable
+                  </button>
+                </div>
+                
+                <div className="mt-8 pt-8 border-t border-slate-700/50 text-left bg-slate-900/50 -mx-8 -mb-8 p-8">
+                  <h4 className="font-semibold text-slate-300 mb-2">How to connect from Windows:</h4>
+                  <ol className="list-decimal pl-5 text-slate-400 space-y-2 text-sm">
+                    <li>Open <strong>File Explorer</strong> (Win + E).</li>
+                    <li>Click on the address bar at the very top.</li>
+                    <li>Type <code className="bg-slate-800 px-2 py-0.5 rounded text-indigo-300">\\{window.location.hostname}\SimpleNAS_Pool</code> and press Enter.</li>
+                    <li>Right-click the folder and select "Map network drive" for easy access!</li>
+                  </ol>
+                </div>
             </div>
           </div>
         )}
