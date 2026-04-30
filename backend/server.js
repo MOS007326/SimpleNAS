@@ -4,31 +4,169 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs/promises';
 import si from 'systeminformation';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const execAsync = promisify(exec);
 const app = express();
-const PORT = 3001;
+const PORT = 80;
 
 app.use(cors());
 app.use(express.json());
 
-// API route to list block devices (disks)
+// Serve static frontend files from 'dist' directory
+app.use(express.static(path.join(__dirname, '../frontend/dist')));
+
+// ─── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Rebuild the MergerFS pool mount using explicit colon-separated branches.
+ * No glob patterns — we list every /mnt/disk_* that is currently mounted.
+ */
+async function rebuildMergerFsMount() {
+    try {
+        const { stdout } = await execAsync(`findmnt -rn -t ext4 -o TARGET`);
+        const dataMounts = stdout.split('\n').filter(m => m.trim().startsWith('/mnt/disk_')).sort();
+
+        // Remove old pool entry from fstab
+        await execAsync(`sed -i '/\\/mnt\\/pool/d' /etc/fstab`);
+
+        if (dataMounts.length === 0) {
+            // No data drives — unmount pool if mounted, nothing to do
+            try { await execAsync(`umount -l /mnt/pool`); } catch (e) {}
+            console.log('No data drives found — pool not mounted.');
+            return;
+        }
+
+        const branches = dataMounts.join(':');
+        const entry = `${branches} /mnt/pool fuse.mergerfs defaults,allow_other,cache.files=partial,dropcacheonclose=true,category.create=mfs,minfreespace=10M,nofail 0 0`;
+
+        // Write via temp file to avoid shell escaping issues
+        await fs.writeFile('/tmp/pool_fstab_entry', entry + '\n');
+        await execAsync(`cat /tmp/pool_fstab_entry >> /etc/fstab && rm /tmp/pool_fstab_entry`);
+
+        // Ensure mount point exists and is empty
+        await execAsync(`mkdir -p /mnt/pool`);
+        try { await execAsync(`umount -l /mnt/pool`); } catch (e) {}
+
+        // 5. MASK THE UNDERLYING FOLDER (Ghost Drive Protection)
+        // We set it to 000 so if MergerFS is not mounted, Samba/Users see nothing.
+        await execAsync(`chmod 000 /mnt/pool`);
+
+        // 6. Mount the pool
+        await execAsync(`mount /mnt/pool`);
+        console.log(`MergerFS pool mounted with branches: ${branches}`);
+    } catch (err) {
+        console.error('Failed to rebuild MergerFS mount:', err.message);
+    }
+}
+
+/**
+ * Dynamically generate /etc/snapraid.conf from mounted disks.
+ * Preserves existing disk name assignments (d1, d2, etc.) for stability.
+ */
+async function generateSnapraidConfig() {
+    try {
+        let existingConfig = '';
+        try { existingConfig = await fs.readFile('/etc/snapraid.conf', 'utf8'); } catch (e) {}
+
+        const existingDisks = {}; // e.g. { 'd1': '/mnt/disk_sdb' }
+        const existingParity = [];
+        if (existingConfig) {
+            existingConfig.split('\n').forEach(line => {
+                const match = line.match(/^disk\s+(d[0-9]+)\s+(.+)$/);
+                if (match) existingDisks[match[1]] = match[2];
+
+                const pMatch = line.match(/^([2-6]-)?parity\s+(.+)$/);
+                if (pMatch) existingParity.push(pMatch[2]);
+            });
+        }
+
+        // Get actual mount points from the OS
+        const { stdout: findmntOut } = await execAsync('findmnt -rn -t ext4 -o TARGET');
+        const activeMounts = findmntOut.split('\n').map(m => m.trim()).filter(Boolean);
+
+        const dataDisks = activeMounts.filter(m => m.startsWith('/mnt/disk_')).sort();
+        const parityMounts = activeMounts.filter(m => m.startsWith('/mnt/parity_')).sort();
+        let parityDisks = parityMounts.map(m => `${m}/snapraid.parity`);
+
+        // If no parity disks found, use existing ones (in case they are temporarily unmounted)
+        if (parityDisks.length === 0) parityDisks = existingParity;
+
+        // Map currently mounted disks to their existing d-numbers
+        const finalDisks = {};
+        const unassignedMounts = [];
+
+        dataDisks.forEach(mount => {
+            let foundKey = null;
+            for (const [key, path] of Object.entries(existingDisks)) {
+                if (path === mount) {
+                    foundKey = key;
+                    break;
+                }
+            }
+            if (foundKey) {
+                finalDisks[foundKey] = mount;
+            } else {
+                unassignedMounts.push(mount);
+            }
+        });
+
+        // Assign new d-numbers to new mounts
+        let nextDiskNum = 1;
+        unassignedMounts.forEach(mount => {
+            while (finalDisks[`d${nextDiskNum}`] || existingDisks[`d${nextDiskNum}`]) {
+                nextDiskNum++;
+            }
+            finalDisks[`d${nextDiskNum}`] = mount;
+        });
+
+        let config = `# SnapRAID Configuration\n# Automatically generated by SimpleNAS\n\n`;
+
+        config += `# Parity drives\n`;
+        parityDisks.forEach((p, i) => {
+            if (i === 0) config += `parity ${p}\n`;
+            else config += `${i+1}-parity ${p}\n`;
+        });
+
+        config += `\n# Content files (copies of the index)\n`;
+        config += `content /var/snapraid.content\n`;
+        Object.keys(finalDisks).sort().forEach(dKey => {
+            config += `content ${finalDisks[dKey]}/snapraid.content\n`;
+        });
+
+        config += `\n# Data disks\n`;
+        Object.keys(finalDisks).sort().forEach(dKey => {
+            config += `disk ${dKey} ${finalDisks[dKey]}\n`;
+        });
+
+        config += `\n# Excludes\n`;
+        config += `exclude *.unrecoverable\nexclude /tmp/\nexclude /lost+found/\n`;
+
+        await fs.writeFile('/etc/snapraid.conf', config, 'utf8');
+        console.log('Successfully generated /etc/snapraid.conf');
+    } catch (err) {
+        console.error('Failed to generate snapraid config:', err);
+    }
+}
+
+// ─── API Routes ────────────────────────────────────────────────────────────────
+
+// List block devices
 app.get('/api/disks', async (req, res) => {
     try {
-        const { stdout } = await execAsync('lsblk -J -o NAME,SIZE,TYPE,MOUNTPOINTS,FSTYPE,MODEL,SERIAL');
+        const { stdout } = await execAsync('lsblk -b -J -o NAME,SIZE,TYPE,MOUNTPOINTS,FSTYPE,MODEL,SERIAL');
         const data = JSON.parse(stdout);
-        const blockDevices = data.blockdevices.filter(dev => dev.type === 'disk' && !dev.name.startsWith('loop'));
-        
-        // Fallback since si.smart is not working
-        const smartData = [];
-        
-        const enhancedDisks = blockDevices.map(disk => {
-            return {
-                ...disk,
-                temperature: 'Unknown',
-                health: 'Unknown'
-            };
-        });
+        const blockDevices = data.blockdevices.filter(dev => dev.type === 'disk' && !dev.name.startsWith('loop') && !dev.name.startsWith('sr'));
+
+        const enhancedDisks = blockDevices.map(disk => ({
+            ...disk,
+            temperature: 'Unknown',
+            health: 'Unknown'
+        }));
 
         res.json({ success: true, disks: enhancedDisks });
     } catch (error) {
@@ -37,7 +175,7 @@ app.get('/api/disks', async (req, res) => {
     }
 });
 
-// API route to get MergerFS pool size
+// Get MergerFS pool size
 app.get('/api/system/storage', async (req, res) => {
     try {
         const fsSize = await si.fsSize();
@@ -53,7 +191,7 @@ app.get('/api/system/storage', async (req, res) => {
     }
 });
 
-// API route to get live system metrics
+// Live system metrics
 app.get('/api/system/stats', async (req, res) => {
     try {
         const [cpu, mem, net] = await Promise.all([
@@ -61,12 +199,10 @@ app.get('/api/system/stats', async (req, res) => {
             si.mem(),
             si.networkStats()
         ]);
-        
-        // Get the active interface (usually the first one with traffic)
         const activeNet = net.find(n => n.rx_bytes > 0 || n.tx_bytes > 0) || net[0];
 
-        res.json({ 
-            success: true, 
+        res.json({
+            success: true,
             cpu: cpu.currentLoad,
             memory: { total: mem.total, used: mem.active, percent: (mem.active / mem.total) * 100 },
             network: { rx_sec: activeNet?.rx_sec || 0, tx_sec: activeNet?.tx_sec || 0 }
@@ -77,50 +213,12 @@ app.get('/api/system/stats', async (req, res) => {
     }
 });
 
-// Helper function to dynamically generate snapraid.conf
-async function generateSnapraidConfig() {
-    try {
-        const { stdout: mounts } = await execAsync('ls -1 /mnt');
-        const mntDirs = mounts.split('\n').filter(Boolean);
-        
-        const dataDisks = mntDirs.filter(d => d.startsWith('disk_'));
-        const parityDisks = mntDirs.filter(d => d.startsWith('parity_'));
+// ─── Storage Management ────────────────────────────────────────────────────────
 
-        let config = `
-# SnapRAID Configuration
-# Automatically generated by SimpleNAS
-
-# Parity drives
-`;
-        parityDisks.forEach((p, i) => {
-            config += `parity /mnt/${p}/snapraid.parity\n`;
-        });
-
-        config += `\n# Content files (copies of the index)\n`;
-        config += `content /var/snapraid.content\n`;
-        dataDisks.forEach((d) => {
-            config += `content /mnt/${d}/snapraid.content\n`;
-        });
-
-        config += `\n# Data disks\n`;
-        dataDisks.forEach((d, i) => {
-            config += `disk d${i + 1} /mnt/${d}\n`;
-        });
-
-        config += `\n# Excludes\n`;
-        config += `exclude *.unrecoverable\nexclude /tmp/\nexclude /lost+found/\n`;
-
-        await fs.writeFile('/etc/snapraid.conf', config, 'utf8');
-        console.log('Successfully generated /etc/snapraid.conf');
-    } catch (err) {
-        console.error('Failed to generate snapraid config:', err);
-    }
-}
-
-// API route to format a disk and add to pool
+// Format a disk and add to pool
 app.post('/api/disks/format', async (req, res) => {
-    const { disk } = req.body; // e.g., 'sdb'
-    
+    const { disk } = req.body;
+
     if (!disk || typeof disk !== 'string' || !disk.match(/^[a-z0-9]+$/)) {
         return res.status(400).json({ success: false, error: 'Invalid disk name' });
     }
@@ -129,77 +227,65 @@ app.post('/api/disks/format', async (req, res) => {
     const partitionPath = `/dev/${disk}1`;
 
     try {
-        // Safety check: Ensure it's not the OS drive by checking if it has a root mountpoint
+        // Safety check: Ensure it's not the OS drive
         const { stdout: lsblkOut } = await execAsync(`lsblk -J -o NAME,MOUNTPOINTS ${devicePath}`);
         const data = JSON.parse(lsblkOut);
         const targetDisk = data.blockdevices[0];
-        
+
         const isOS = targetDisk.children?.some(part => part.mountpoints?.includes('/'));
         if (isOS) {
             return res.status(403).json({ success: false, error: 'Cannot format the OS drive!' });
         }
 
-        // Safety check: check if it's already mounted anywhere
         const isMounted = targetDisk.children?.some(part => part.mountpoints?.length > 0 && part.mountpoints[0] !== null);
         if (isMounted) {
             return res.status(403).json({ success: false, error: 'Disk has mounted partitions. Unmount first.' });
         }
 
         console.log(`Starting format of ${devicePath}...`);
-        
-        // 1. Create GPT label
+
+        // 1. Partition and format
         await execAsync(`parted -s ${devicePath} mklabel gpt`);
-        
-        // 2. Create primary partition using 100% of space
         await execAsync(`parted -s ${devicePath} mkpart primary ext4 0% 100%`);
-        
-        // Wait a second for the OS to register the new partition node (/dev/sdb1)
         await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        // 3. Format to ext4 (-F forces format, -L sets label, -E nodiscard makes it faster on VMs)
         await execAsync(`mkfs.ext4 -F -L data_${disk} ${partitionPath}`);
-        
-        // 4. Get UUID
+        await execAsync(`tune2fs -m 0 ${partitionPath}`); // Remove reserved blocks to prevent Windows confusion
+
+        // 2. Get UUID and mount
         const { stdout: uuidOut } = await execAsync(`blkid -s UUID -o value ${partitionPath}`);
         const uuid = uuidOut.trim();
 
-        // 5. Create mount point
         const mountPoint = `/mnt/disk_${disk}`;
         await execAsync(`mkdir -p ${mountPoint}`);
 
-        // 6. Add to /etc/fstab if not present
-        const fstabEntry = `UUID=${uuid} ${mountPoint} ext4 defaults 0 2`;
-        await execAsync(`grep -q "${mountPoint}" /etc/fstab || echo "${fstabEntry}" >> /etc/fstab`);
+        // 3. Add to fstab with nofail (remove old entry first)
+        await execAsync(`sed -i '\\|${mountPoint}|d' /etc/fstab`);
+        const fstabEntry = `UUID=${uuid} ${mountPoint} ext4 defaults,nofail 0 2`;
+        await fs.writeFile('/tmp/disk_fstab_entry', fstabEntry + '\n');
+        await execAsync(`cat /tmp/disk_fstab_entry >> /etc/fstab && rm /tmp/disk_fstab_entry`);
 
-        // 7. Mount the drive
+        // 4. Mount the drive
         await execAsync(`mount ${mountPoint}`);
 
-        // 8. Ensure MergerFS pool is in fstab
-        const mergerFsEntry = `/mnt/disk_* /mnt/pool fuse.mergerfs defaults,allow_other,use_ino,cache.files=partial,dropcacheonclose=true,category.create=mfs 0 0`;
-        await execAsync(`mkdir -p /mnt/pool`);
-        await execAsync(`grep -q "/mnt/pool" /etc/fstab || echo "${mergerFsEntry}" >> /etc/fstab`);
+        // 5. Rebuild MergerFS pool with explicit branches
+        await rebuildMergerFsMount();
 
-        // 9. Mount or Remount the pool to include the new drive
-        try {
-            await execAsync(`mountpoint -q /mnt/pool && umount /mnt/pool`);
-        } catch (e) { /* ignore if not mounted */ }
-        await execAsync(`mount /mnt/pool`);
-        
+        // 6. Update SnapRAID config
         await generateSnapraidConfig();
-        
+
         console.log(`Successfully formatted and added ${devicePath} to pool!`);
         res.json({ success: true, message: `Successfully added ${disk} to the storage pool!` });
-        
+
     } catch (error) {
         console.error(`Error formatting ${disk}:`, error);
         res.status(500).json({ success: false, error: error.message || 'Formatting failed' });
     }
 });
 
-// API route to format a disk as a Parity drive
+// Format a disk as Parity drive (with size validation)
 app.post('/api/disks/parity', async (req, res) => {
     const { disk } = req.body;
-    
+
     if (!disk || typeof disk !== 'string' || !disk.match(/^[a-z0-9]+$/)) {
         return res.status(400).json({ success: false, error: 'Invalid disk name' });
     }
@@ -208,132 +294,381 @@ app.post('/api/disks/parity', async (req, res) => {
     const partitionPath = `/dev/${disk}1`;
 
     try {
-        const { stdout: lsblkOut } = await execAsync(`lsblk -J -o NAME,MOUNTPOINTS ${devicePath}`);
-        const data = JSON.parse(lsblkOut);
-        const targetDisk = data.blockdevices[0];
-        
-        const isOS = targetDisk.children?.some(part => part.mountpoints?.includes('/'));
+        const { stdout: lsblkOut } = await execAsync(`lsblk -b -J -o NAME,SIZE,MOUNTPOINTS`);
+        const blockdevices = JSON.parse(lsblkOut).blockdevices;
+
+        const targetDrive = blockdevices.find(d => d.name === disk);
+        if (!targetDrive) return res.status(400).json({ success: false, error: 'Drive not found' });
+
+        const isOS = targetDrive.children?.some(part => part.mountpoints?.includes('/'));
         if (isOS) return res.status(403).json({ success: false, error: 'Cannot use the OS drive!' });
 
-        const isMounted = targetDisk.children?.some(part => part.mountpoints?.length > 0 && part.mountpoints[0] !== null);
+        const isMounted = targetDrive.children?.some(part => part.mountpoints?.length > 0 && part.mountpoints[0] !== null);
         if (isMounted) return res.status(403).json({ success: false, error: 'Disk is mounted. Unmount first.' });
 
+        // SnapRAID Rule: Parity must be >= largest data drive
+        const paritySize = parseInt(targetDrive.size);
+        const dataDriveSizes = blockdevices
+            .filter(d => d.children?.some(p => p.mountpoints?.some(mp => mp && mp.startsWith('/mnt/disk_'))))
+            .map(d => parseInt(d.size));
+
+        if (dataDriveSizes.length > 0) {
+            const largestData = Math.max(...dataDriveSizes);
+            if (paritySize < largestData) {
+                const fmtParity = (paritySize / 1e9).toFixed(1);
+                const fmtData = (largestData / 1e9).toFixed(1);
+                return res.status(400).json({
+                    success: false,
+                    error: `Parity drive (${fmtParity} GB) must be at least as large as your biggest data drive (${fmtData} GB). This is a SnapRAID requirement.`
+                });
+            }
+        }
+
         console.log(`Configuring parity on ${devicePath}...`);
-        
+
         await execAsync(`parted -s ${devicePath} mklabel gpt`);
         await execAsync(`parted -s ${devicePath} mkpart primary ext4 0% 100%`);
         await new Promise(resolve => setTimeout(resolve, 1000));
-        await execAsync(`mkfs.ext4 -F -L parity_${disk} ${partitionPath}`);
-        
+        await execAsync(`mkfs.ext4 -F -m 0 -L parity_${disk} ${partitionPath}`);
+
         const { stdout: uuidOut } = await execAsync(`blkid -s UUID -o value ${partitionPath}`);
         const uuid = uuidOut.trim();
 
         const mountPoint = `/mnt/parity_${disk}`;
         await execAsync(`mkdir -p ${mountPoint}`);
 
-        const fstabEntry = `UUID=${uuid} ${mountPoint} ext4 defaults 0 2`;
-        await execAsync(`grep -q "${mountPoint}" /etc/fstab || echo "${fstabEntry}" >> /etc/fstab`);
+        // Add to fstab with nofail
+        await execAsync(`sed -i '\\|${mountPoint}|d' /etc/fstab`);
+        const fstabEntry = `UUID=${uuid} ${mountPoint} ext4 defaults,nofail 0 2`;
+        await fs.writeFile('/tmp/parity_fstab_entry', fstabEntry + '\n');
+        await execAsync(`cat /tmp/parity_fstab_entry >> /etc/fstab && rm /tmp/parity_fstab_entry`);
         await execAsync(`mount ${mountPoint}`);
 
         await generateSnapraidConfig();
-        
+
         console.log(`Successfully set up ${devicePath} as Parity!`);
         res.json({ success: true, message: `Successfully set ${disk} as Parity drive!` });
-        
+
     } catch (error) {
         console.error(`Error setting parity ${disk}:`, error);
         res.status(500).json({ success: false, error: error.message || 'Parity setup failed' });
     }
 });
 
-// API route to get Samba shares
+// Remove a drive from the pool (for drive replacement workflow)
+app.post('/api/disks/remove', async (req, res) => {
+    const { disk } = req.body;
+
+    if (!disk || typeof disk !== 'string' || !disk.match(/^[a-z0-9]+$/)) {
+        return res.status(400).json({ success: false, error: 'Invalid disk name' });
+    }
+
+    try {
+        // 1. Find where this disk is actually mounted
+        const { stdout: lsblkOut } = await execAsync(`lsblk -b -J -o NAME,MOUNTPOINTS /dev/${disk}`);
+        const diskData = JSON.parse(lsblkOut).blockdevices[0];
+        
+        let mountPoint = null;
+        if (diskData.children) {
+            for (const child of diskData.children) {
+                if (child.mountpoints && child.mountpoints.length > 0 && child.mountpoints[0]) {
+                    mountPoint = child.mountpoints[0];
+                    break;
+                }
+            }
+        }
+
+        if (!mountPoint) {
+            return res.status(400).json({ success: false, error: `Drive ${disk} is not currently mounted.` });
+        }
+
+        if (!mountPoint.startsWith('/mnt/disk_')) {
+             return res.status(400).json({ success: false, error: `Drive ${disk} is mounted at ${mountPoint}, which is not a managed data pool path.` });
+        }
+
+        // 2. Find SnapRAID disk name (d1, d2, etc.) from config
+        let snapraidDiskName = null;
+        try {
+            const config = await fs.readFile('/etc/snapraid.conf', 'utf8');
+            const match = config.match(new RegExp(`^disk\\s+(d\\d+)\\s+${mountPoint.replace(/\//g, '\\/')}`, 'm'));
+            if (match) snapraidDiskName = match[1];
+        } catch (e) {}
+
+        // 3. Unmount the drive
+        await execAsync(`umount -l ${mountPoint}`);
+        console.log(`Unmounted ${mountPoint}`);
+
+        // 4. Remove fstab entry for this drive
+        await execAsync(`sed -i '\\|${mountPoint}|d' /etc/fstab`);
+
+        // 5. Rebuild pool without this drive
+        await rebuildMergerFsMount();
+
+        console.log(`Removed ${disk} from pool (SnapRAID name: ${snapraidDiskName})`);
+        res.json({
+            success: true,
+            message: `Drive ${disk} removed from pool. You can now physically replace it.`,
+            snapraidDiskName
+        });
+
+    } catch (error) {
+        console.error(`Error removing ${disk}:`, error);
+        res.status(500).json({ success: false, error: error.message || 'Remove failed' });
+    }
+});
+
+// ─── Samba Shares ──────────────────────────────────────────────────────────────
+
 app.get('/api/shares', async (req, res) => {
     try {
         const { stdout: conf } = await execAsync('cat /etc/samba/smb.conf');
         const shares = [];
         const lines = conf.split('\n');
         let currentShare = null;
-        
+
         for (const line of lines) {
             const match = line.match(/^\[(.*)\]$/);
-            if (match && match[1] !== 'global') {
+            if (match) {
                 if (currentShare) shares.push(currentShare);
-                currentShare = { name: match[1], enabled: true };
+                currentShare = { name: match[1], enabled: true, path: '' };
             } else if (currentShare && line.trim().startsWith('path =')) {
                 currentShare.path = line.split('=')[1].trim();
             }
         }
         if (currentShare) shares.push(currentShare);
 
-        res.json({ success: true, shares });
+        // Find our managed share
+        const managedShare = shares.find(s => s.path === '/mnt/pool') || { name: 'SimpleNAS_Pool', path: '/mnt/pool', enabled: false };
+
+        res.json({ success: true, shares, managedShare });
     } catch (error) {
-        console.error('Error fetching shares:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// API route to enable/create default pool share
-app.post('/api/shares/enable', async (req, res) => {
-    try {
-        const shareConfig = `
-[SimpleNAS_Pool]
+async function applySambaConfig(shareName, isPublic, password = null) {
+    // 1. Prepare base config (cleaner than default)
+    const baseConfig = `[global]
+   workgroup = WORKGROUP
+   server role = standalone server
+   map to guest = bad user
+   log file = /var/log/samba/log.%m
+   max log size = 1000
+   logging = file
+   panic action = /usr/share/samba/panic-action %d
+   obey pam restrictions = yes
+   unix password sync = yes
+   passwd program = /usr/bin/passwd %u
+   passwd chat = *Enter\\snew\\s*\\spassword:* %n\\n *Retype\\snew\\s*\\spassword:* %n\\n *password\\supdated\\ssuccessfully* .
+   pam password change = yes
+   usershare allow guests = yes
+`;
+
+    let shareConfig = `
+[${shareName}]
    path = /mnt/pool
    browseable = yes
    read only = no
-   guest ok = yes
    create mask = 0777
    directory mask = 0777
+   force user = root
 `;
-        await execAsync(`grep -q "\\[SimpleNAS_Pool\\]" /etc/samba/smb.conf || echo "${shareConfig}" >> /etc/samba/smb.conf`);
-        await execAsync(`systemctl restart smbd`);
-        
-        res.json({ success: true, message: 'Share SimpleNAS_Pool enabled successfully!' });
+
+    if (isPublic) {
+        shareConfig += `   guest ok = yes\n`;
+    } else {
+        shareConfig += `   guest ok = no\n   valid users = simplenas\n`;
+        if (password) {
+            await execAsync(`id -u simplenas || useradd -M -s /usr/sbin/nologin simplenas`);
+            await execAsync(`(echo "${password}"; echo "${password}") | smbpasswd -s -a simplenas`);
+        }
+    }
+
+    await fs.writeFile('/etc/samba/smb.conf', baseConfig + shareConfig);
+    await execAsync(`systemctl restart smbd nmbd`);
+
+    // Ensure the pool is actually mounted before the user tries to use the share
+    await rebuildMergerFsMount();
+}
+
+app.post('/api/shares/enable', async (req, res) => {
+    const { shareName = 'SimpleNAS_Pool' } = req.body;
+    try {
+        await applySambaConfig(shareName, true);
+        res.json({ success: true, message: `Public share [${shareName}] enabled!` });
     } catch (error) {
-        console.error('Error enabling share:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// API route to set Samba credentials
 app.post('/api/shares/credentials', async (req, res) => {
-    const { password } = req.body;
+    const { password, shareName = 'SimpleNAS_Pool' } = req.body;
     if (!password || password.length < 4) {
         return res.status(400).json({ success: false, error: 'Password must be at least 4 characters' });
     }
 
     try {
-        // Create linux user 'simplenas' if it doesn't exist
-        await execAsync(`id -u simplenas || useradd -M -s /usr/sbin/nologin simplenas`);
-        
-        // Set samba password non-interactively
-        await execAsync(`(echo "${password}"; echo "${password}") | smbpasswd -s -a simplenas`);
-        
-        // Update smb.conf to require the user
-        const shareConfig = `
-[SimpleNAS_Pool]
-   path = /mnt/pool
-   browseable = yes
-   read only = no
-   valid users = simplenas
-   force user = root
-   create mask = 0777
-   directory mask = 0777
-`;
-        // Remove existing [SimpleNAS_Pool] section and append the secure one
-        await execAsync(`sed -i '/\\[SimpleNAS_Pool\\]/,$d' /etc/samba/smb.conf`);
-        await execAsync(`echo "${shareConfig}" >> /etc/samba/smb.conf`);
-        await execAsync(`systemctl restart smbd`);
-        
-        res.json({ success: true, message: 'Security updated! Username is: simplenas' });
+        await applySambaConfig(shareName, false, password);
+        res.json({ success: true, message: `Private share [${shareName}] enabled for user 'simplenas'.` });
     } catch (error) {
-        console.error('Error setting credentials:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Basic health check
+// ─── SnapRAID Management ───────────────────────────────────────────────────────
+
+app.post('/api/snapraid/sync', async (req, res) => {
+    try {
+        await execAsync(`nohup snapraid sync > /var/log/snapraid_sync.log 2>&1 &`);
+        res.json({ success: true, message: 'SnapRAID sync started in the background.' });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/api/snapraid/status', async (req, res) => {
+    try {
+        const { stdout } = await execAsync(`tail -n 50 /var/log/snapraid_sync.log || echo "No sync log found."`);
+
+        let progress = 0;
+        const matches = stdout.match(/(\d+)%/g);
+        if (matches) {
+            progress = parseInt(matches[matches.length - 1]);
+        }
+
+        const { stdout: isRunning } = await execAsync(`pgrep snapraid || echo ""`);
+        res.json({ success: true, log: stdout, running: isRunning.trim().length > 0, progress });
+    } catch (error) {
+        res.json({ success: true, log: 'No sync has been run yet.', running: false, progress: 0 });
+    }
+});
+
+app.post('/api/snapraid/cron', async (req, res) => {
+    const { enable, time } = req.body;
+    try {
+        const scriptPath = '/usr/local/bin/simplenas-snapraid.sh';
+        const cronPath = '/etc/cron.d/simplenas-snapraid';
+
+        if (enable) {
+            let hour = '2';
+            let minute = '0';
+            if (time && time.includes(':')) {
+                const parts = time.split(':');
+                hour = parseInt(parts[0], 10);
+                minute = parseInt(parts[1], 10);
+            }
+
+            const cronScript = `#!/bin/bash\nsnapraid sync >> /var/log/snapraid_sync.log 2>&1\nsnapraid scrub >> /var/log/snapraid_sync.log 2>&1\n`;
+            await fs.writeFile(scriptPath, cronScript, { mode: 0o755 });
+
+            const cronJob = `${minute} ${hour} * * * root ${scriptPath}\n`;
+            await fs.writeFile(cronPath, cronJob, { mode: 0o644 });
+
+            await execAsync(`rm -f /etc/cron.daily/simplenas-snapraid`);
+
+            res.json({ success: true, message: `Daily SnapRAID sync scheduled for ${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}.` });
+        } else {
+            await execAsync(`rm -f ${cronPath} ${scriptPath}`);
+            res.json({ success: true, message: 'Automated SnapRAID sync disabled.' });
+        }
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// SnapRAID Health — detect missing disks
+app.get('/api/snapraid/health', async (req, res) => {
+    try {
+        let existingConfig = '';
+        try { existingConfig = await fs.readFile('/etc/snapraid.conf', 'utf8'); } catch (e) {
+            return res.json({ success: true, missingDisks: [] });
+        }
+
+        const missingDisks = [];
+        const lines = existingConfig.split('\n');
+        for (const line of lines) {
+            const match = line.match(/^disk\s+(d[0-9]+)\s+(.+)$/);
+            if (match) {
+                const diskName = match[1];
+                const mountPoint = match[2];
+                try {
+                    await execAsync(`mountpoint -q ${mountPoint}`);
+                } catch (e) {
+                    missingDisks.push({ name: diskName, mountPoint });
+                }
+            }
+        }
+        res.json({ success: true, missingDisks });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// SnapRAID Fix — rebuild data onto a replacement drive
+app.post('/api/snapraid/fix', async (req, res) => {
+    const { missingDiskName, newDiskDevice } = req.body;
+
+    if (!missingDiskName || !newDiskDevice || !newDiskDevice.match(/^[a-z0-9]+$/)) {
+        return res.status(400).json({ success: false, error: 'Invalid parameters' });
+    }
+
+    const devicePath = `/dev/${newDiskDevice}`;
+    const partitionPath = `/dev/${newDiskDevice}1`;
+
+    try {
+        // Format the new disk
+        await execAsync(`parted -s ${devicePath} mklabel gpt`);
+        await execAsync(`parted -s ${devicePath} mkpart primary ext4 0% 100%`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await execAsync(`mkfs.ext4 -F -L data_${newDiskDevice} ${partitionPath}`);
+        await execAsync(`tune2fs -m 0 ${partitionPath}`); // Remove reserved blocks to prevent Windows confusion
+
+        const { stdout: uuidOut } = await execAsync(`blkid -s UUID -o value ${partitionPath}`);
+        const uuid = uuidOut.trim();
+
+        const mountPoint = `/mnt/disk_${newDiskDevice}`;
+        await execAsync(`mkdir -p ${mountPoint}`);
+
+        // Add to fstab with nofail
+        await execAsync(`sed -i '\\|${mountPoint}|d' /etc/fstab`);
+        const fstabEntry = `UUID=${uuid} ${mountPoint} ext4 defaults,nofail 0 2`;
+        await fs.writeFile('/tmp/fix_fstab_entry', fstabEntry + '\n');
+        await execAsync(`cat /tmp/fix_fstab_entry >> /etc/fstab && rm /tmp/fix_fstab_entry`);
+        await execAsync(`mount ${mountPoint}`);
+
+        // Rebuild pool to include the replacement disk
+        await rebuildMergerFsMount();
+
+        // Update snapraid.conf to point the missing disk name to the new mountpoint
+        let config = await fs.readFile('/etc/snapraid.conf', 'utf8');
+        const configLines = config.split('\n');
+        const newLines = configLines.map(line => {
+            if (line.startsWith(`disk ${missingDiskName} `)) {
+                return `disk ${missingDiskName} ${mountPoint}`;
+            }
+            return line;
+        });
+        await fs.writeFile('/etc/snapraid.conf', newLines.join('\n'), 'utf8');
+
+        // Start the fix process in the background with force flags
+        await execAsync(`nohup snapraid fix -d ${missingDiskName} --force-uuid --force-device > /var/log/snapraid_sync.log 2>&1 &`);
+
+        res.json({ success: true, message: `Recovery started! Rebuilding data onto ${newDiskDevice}.` });
+    } catch (error) {
+        console.error('Error starting fix:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ─── General ───────────────────────────────────────────────────────────────────
+
 app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', uptime: process.uptime() });
+});
+
+// Fallback to index.html for React routing
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
 });
 
 app.listen(PORT, '0.0.0.0', () => {
