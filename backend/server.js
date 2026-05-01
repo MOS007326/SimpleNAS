@@ -306,8 +306,12 @@ app.post('/api/disks/format', async (req, res) => {
         const { stdout: uuidOut } = await execAsync(`blkid -s UUID -o value ${partitionPath}`);
         const uuid = uuidOut.trim();
         
-        // C1: Use Serial for persistent mount point name (Ghost Drive Elimination)
-        const mountPoint = `/mnt/disk_${targetDisk.serial || disk}`;
+        // C1: VM-Safe Composite ID (Ghost Drive Elimination)
+        // Uses serial + device letter to prevent mount point collisions in VMs where
+        // all virtual disks may share the same serial (e.g. QEMU_HARDDISK).
+        const rawSerial = (targetDisk.serial || '').replace(/[^a-zA-Z0-9]/g, '');
+        const serialId = rawSerial ? `${rawSerial}_${disk}` : disk;
+        const mountPoint = `/mnt/disk_${serialId}`;
         await execAsync(`mkdir -p ${mountPoint}`);
 
         // 3. Add to fstab with nofail (remove old entry first)
@@ -401,8 +405,10 @@ app.post('/api/disks/parity', async (req, res) => {
         const { stdout: uuidOut } = await execAsync(`blkid -s UUID -o value ${partitionPath}`);
         const uuid = uuidOut.trim();
 
-        // C1: Use Serial for persistent mount point name
-        const mountPoint = `/mnt/parity_${targetDrive.serial || disk}`;
+        // C1: VM-Safe Composite ID for parity drive
+        const rawSerial = (targetDrive.serial || '').replace(/[^a-zA-Z0-9]/g, '');
+        const serialId = rawSerial ? `${rawSerial}_${disk}` : disk;
+        const mountPoint = `/mnt/parity_${serialId}`;
         await execAsync(`mkdir -p ${mountPoint}`);
 
         // Add to fstab with nofail
