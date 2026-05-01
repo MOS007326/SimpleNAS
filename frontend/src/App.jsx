@@ -96,16 +96,16 @@ function App() {
     }
   };
 
-  const handleSnapraidSync = async (force = false, full = false) => {
+  const handleSnapraidSync = async (force = false, full = false, forceUuid = false) => {
     try {
       const res = await fetch(`/api/snapraid/sync`, { 
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ force, full })
+        body: JSON.stringify({ force, full, forceUuid })
       });
       const data = await res.json();
       if (data.success) {
-        alert(full ? "Full Rebuild started!" : (force ? "Forced Sync started!" : "Sync started!"));
+        alert(full ? "Full Rebuild started!" : (forceUuid ? "Sync with UUID update started!" : (force ? "Forced Sync started!" : "Sync started!")));
         fetchSnapraidStatus();
       } else {
         alert("Failed to start sync: " + data.error);
@@ -597,6 +597,14 @@ function App() {
                       className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-sm font-medium transition-colors shadow-lg shadow-rose-600/20"
                     >
                       🔥 Force Full Rebuild
+                    </button>
+                  )}
+                  {!snapraidStatus.running && snapraidStatus.log && snapraidStatus.log.includes('--force-uuid') && (
+                    <button 
+                      onClick={() => handleSnapraidSync(false, false, true)}
+                      className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-sm font-medium transition-colors shadow-lg shadow-amber-500/20"
+                    >
+                      🆔 Fix UUID Mismatch
                     </button>
                   )}
                 </div>

@@ -596,7 +596,7 @@ app.post('/api/shares/credentials', async (req, res) => {
 // ─── SnapRAID Management ───────────────────────────────────────────────────────
 
 app.post('/api/snapraid/sync', async (req, res) => {
-    const { force = false, full = false } = req.body;
+    const { force = false, full = false, forceUuid = false } = req.body;
     try {
         // H2: Pre-sync mount verification
         const config = await fs.readFile('/etc/snapraid.conf', 'utf8');
@@ -617,6 +617,7 @@ app.post('/api/snapraid/sync', async (req, res) => {
 
         let cmd = 'snapraid sync';
         if (full) cmd = 'snapraid --force-empty --force-full sync';
+        else if (forceUuid) cmd = 'snapraid --force-uuid sync';
         else if (force) cmd = 'snapraid --force-empty sync';
         
         await execAsync(`nohup ${cmd} > /var/log/snapraid_sync.log 2>&1 &`);
