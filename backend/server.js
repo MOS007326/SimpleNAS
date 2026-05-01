@@ -31,7 +31,7 @@ async function rebuildMergerFsMount() {
     try {
         // Find all data disk mount points in fstab, excluding the pool itself
         const fstab = await fs.readFile('/etc/fstab', 'utf8');
-        const dataMounts = fstab.split('\n')
+        const potentialMounts = fstab.split('\n')
             .filter(line => {
                 const trimmed = line.trim();
                 if (!trimmed || trimmed.startsWith('#')) return false;
@@ -42,6 +42,17 @@ async function rebuildMergerFsMount() {
             .map(line => line.split(/\s+/)[1])
             .filter(Boolean)
             .sort();
+
+        // CRITICAL SAFETY: Only include paths that are ACTUAL hardware mountpoints
+        const dataMounts = [];
+        for (const mp of potentialMounts) {
+            try {
+                await execAsync(`mountpoint -q ${mp}`);
+                dataMounts.push(mp);
+            } catch (e) {
+                console.warn(`⚠️ Safety Warning: ${mp} is in fstab but NOT mounted. Excluding from pool to prevent Ghost Drive!`);
+            }
+        }
 
         // Remove old pool entry from fstab before rebuilding
         await execAsync(`sed -i '/\\/mnt\\/pool/d' /etc/fstab`);
