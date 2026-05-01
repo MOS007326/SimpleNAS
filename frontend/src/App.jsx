@@ -781,7 +781,7 @@ function App() {
                   <ol className="list-decimal pl-5 text-slate-400 space-y-2 text-sm">
                     <li>Open <strong>File Explorer</strong> (Win + E).</li>
                     <li>Click on the address bar at the very top.</li>
-                    <li>Type <code className="bg-slate-800 px-2 py-0.5 rounded text-indigo-300">\\\\{window.location.hostname}\\{shareName}</code> and press Enter.</li>
+                    <li>Type <code className="bg-slate-800 px-2 py-0.5 rounded text-indigo-300">\\{window.location.hostname}\{shareName}</code> and press Enter.</li>
                     <li>Right-click the folder and select "Map network drive" for easy access!</li>
                   </ol>
                 </div>
