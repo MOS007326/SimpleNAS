@@ -179,7 +179,7 @@ app.get('/api/disks', async (req, res) => {
             let temp = 'Unknown';
             try {
                 // M1: S.M.A.R.T. Monitoring
-                const { stdout: smart } = await execAsync(`smartctl -A -H -j /dev/${disk.name}`, { timeout: 2000 });
+                const { stdout: smart } = await execAsync(`smartctl -A -H -j /dev/${disk.name}`, { timeout: 3000 });
                 const smartData = JSON.parse(smart);
                 health = smartData.smart_status?.passed ? 'passed' : (smartData.smart_status ? 'FAILING' : 'Unknown');
                 temp = smartData.temperature?.current || 'Unknown';
@@ -266,13 +266,22 @@ app.post('/api/disks/format', async (req, res) => {
             return res.status(403).json({ success: false, error: 'Disk has mounted partitions. Unmount first.' });
         }
 
-        // H4: Safety check: Ensure it's not a parity drive
+        // H4: Safety check: Ensure it's not a parity drive (unless forced)
         const label = targetDisk.children?.[0]?.label || '';
-        if (label.startsWith('parity_')) {
-            return res.status(403).json({ success: false, error: 'This drive is already configured as a Parity drive. You cannot add it to the Data pool without clearing it first.' });
+        if (!req.body.force && label.startsWith('parity_')) {
+            return res.status(403).json({ 
+                success: false, 
+                code: 'ROLE_CONFLICT',
+                error: 'This drive is already configured as a Parity drive. You cannot add it to the Data pool without clearing it first.' 
+            });
         }
 
         console.log(`Starting format of ${devicePath}...`);
+        
+        // Ensure unmounted if forcing
+        if (req.body.force) {
+            try { await execAsync(`umount -l ${devicePath}*`); } catch (e) {}
+        }
 
         // 1. Partition and format
         await execAsync(`parted -s ${devicePath} mklabel gpt`);
@@ -337,10 +346,19 @@ app.post('/api/disks/parity', async (req, res) => {
         const isMounted = targetDrive.children?.some(part => part.mountpoints?.length > 0 && part.mountpoints[0] !== null);
         if (isMounted) return res.status(403).json({ success: false, error: 'Disk is mounted. Unmount first.' });
         
-        // H4: Safety check: Ensure it's not a data drive
+        // H4: Safety check: Ensure it's not a data drive (unless forced)
         const label = targetDrive.children?.[0]?.label || '';
-        if (label.startsWith('data_')) {
-            return res.status(403).json({ success: false, error: 'This drive is already configured as a Data drive. You cannot add it to Parity without clearing it first.' });
+        if (!req.body.force && label.startsWith('data_')) {
+            return res.status(403).json({ 
+                success: false, 
+                code: 'ROLE_CONFLICT',
+                error: 'This drive is already configured as a Data drive. You cannot add it to Parity without clearing it first.' 
+            });
+        }
+
+        // Ensure unmounted if forcing
+        if (req.body.force) {
+            try { await execAsync(`umount -l ${devicePath}*`); } catch (e) {}
         }
 
         // SnapRAID Rule: Parity must be >= largest data drive

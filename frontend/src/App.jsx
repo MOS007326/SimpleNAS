@@ -134,8 +134,8 @@ function App() {
     }
   };
 
-  const handleFormat = async (diskName) => {
-    if (!window.confirm(`WARNING: Are you sure you want to format /dev/${diskName}?\n\nALL DATA ON THIS DRIVE WILL BE PERMANENTLY ERASED!`)) {
+  const handleFormat = async (diskName, force = false) => {
+    if (!force && !window.confirm(`WARNING: Are you sure you want to format /dev/${diskName}?\n\nALL DATA ON THIS DRIVE WILL BE PERMANENTLY ERASED!`)) {
       return;
     }
     
@@ -143,12 +143,16 @@ function App() {
       const res = await fetch(`/api/disks/format`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ disk: diskName })
+        body: JSON.stringify({ disk: diskName, force })
       });
       const data = await res.json();
       if (data.success) {
         alert(data.message);
         fetchDisks(); // Refresh the disk list
+      } else if (data.code === 'ROLE_CONFLICT') {
+        if (window.confirm(`${data.error}\n\nDo you want to FORCE WIPE this drive and re-purpose it for the Data Pool?`)) {
+          handleFormat(diskName, true);
+        }
       } else {
         alert('Format failed: ' + data.error);
       }
@@ -158,8 +162,8 @@ function App() {
     }
   };
 
-  const handleParity = async (diskName) => {
-    if (!window.confirm(`WARNING: Are you sure you want to format /dev/${diskName} as the PARITY drive?\n\nALL DATA ON THIS DRIVE WILL BE PERMANENTLY ERASED!`)) {
+  const handleParity = async (diskName, force = false) => {
+    if (!force && !window.confirm(`WARNING: Are you sure you want to format /dev/${diskName} as the PARITY drive?\n\nALL DATA ON THIS DRIVE WILL BE PERMANENTLY ERASED!`)) {
       return;
     }
     
@@ -167,12 +171,16 @@ function App() {
       const res = await fetch(`/api/disks/parity`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ disk: diskName })
+        body: JSON.stringify({ disk: diskName, force })
       });
       const data = await res.json();
       if (data.success) {
         alert(data.message);
         fetchDisks(); // Refresh the disk list
+      } else if (data.code === 'ROLE_CONFLICT') {
+        if (window.confirm(`${data.error}\n\nDo you want to FORCE WIPE this drive and re-purpose it for Parity?`)) {
+          handleParity(diskName, true);
+        }
       } else {
         alert('Parity setup failed: ' + data.error);
       }
