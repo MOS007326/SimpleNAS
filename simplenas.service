@@ -1,0 +1,14 @@
+[Unit]
+Description=SimpleNAS Appliance Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/node /opt/simplenas/backend/server.js
+WorkingDirectory=/opt/simplenas/backend
+Restart=always
+User=root
+Group=root
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

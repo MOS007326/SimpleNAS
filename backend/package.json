@@ -1,7 +1,7 @@
 {
   "name": "simplenas-backend",
-  "version": "1.0.0",
-  "description": "SimpleNAS backend server",
+  "version": "3.2.0",
+  "description": "SimpleNAS v3.2 backend server",
   "main": "server.js",
   "type": "module",
   "scripts": {
