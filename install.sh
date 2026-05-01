@@ -7,7 +7,7 @@ set -e
 
 # --- Configuration ---
 INSTALL_DIR="/opt/simplenas"
-REPO_URL="https://github.com/SimpleNAS/SimpleNAS.git" # User should update this after pushing
+REPO_URL="https://github.com/MOS007326/SimpleNAS.git" # User should update this after pushing
 
 echo "🚀 Starting SimpleNAS v3.1 Installation..."
 
