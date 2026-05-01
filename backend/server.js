@@ -6,6 +6,7 @@ import fs from 'fs/promises';
 import si from 'systeminformation';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import os from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -503,9 +504,12 @@ app.get('/api/shares', async (req, res) => {
 });
 
 async function applySambaConfig(shareName, isPublic, password = null) {
+    const hostname = os.hostname();
     // 1. Prepare base config (cleaner than default)
     const baseConfig = `[global]
    workgroup = WORKGROUP
+   netbios name = ${hostname.toUpperCase().substring(0, 15)}
+   server string = ${hostname} SimpleNAS
    server role = standalone server
    map to guest = bad user
    log file = /var/log/samba/log.%m
