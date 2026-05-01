@@ -96,12 +96,16 @@ function App() {
     }
   };
 
-  const handleSnapraidSync = async () => {
+  const handleSnapraidSync = async (force = false, full = false) => {
     try {
-      const res = await fetch(`/api/snapraid/sync`, { method: 'POST' });
+      const res = await fetch(`/api/snapraid/sync`, { 
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force, full })
+      });
       const data = await res.json();
       if (data.success) {
-        alert("Sync started!");
+        alert(full ? "Full Rebuild started!" : (force ? "Forced Sync started!" : "Sync started!"));
         fetchSnapraidStatus();
       } else {
         alert("Failed to start sync: " + data.error);
@@ -194,6 +198,7 @@ function App() {
       if (data.success) {
         alert(data.message);
         fetchSnapraidStatus();
+        fetchDisks(); // Refresh health status and disk list immediately
       } else {
         alert("Failed to start recovery: " + data.error);
       }
@@ -201,6 +206,22 @@ function App() {
       alert("Error starting recovery.");
     }
     setLoading(false);
+  };
+
+  const handleUndelete = async () => {
+    if (!window.confirm("Try to recover accidentally deleted files? This will look through the parity data and restore files that are missing from the disks.")) return;
+    try {
+      const res = await fetch(`/api/snapraid/undelete`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        alert(data.message);
+        fetchSnapraidStatus();
+      } else {
+        alert("Undelete failed: " + data.error);
+      }
+    } catch (e) {
+      alert("Error starting undelete.");
+    }
   };
 
   const fetchShares = async () => {
@@ -319,8 +340,31 @@ function App() {
               </div>
             </div>
             
-            {/* Extended Stats */}
+            {/* Array Health & Stats */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6">
+                <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-4">Array Health Status</h3>
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-slate-300">Disk Connectivity</span>
+                    <span className={`text-sm font-bold ${missingDisks.length === 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {missingDisks.length === 0 ? '✓ ALL DRIVES ONLINE' : `⚠️ ${missingDisks.length} DRIVE(S) MISSING`}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-slate-300">Parity Status</span>
+                    <span className={`text-sm font-bold ${snapraidStatus.log && (snapraidStatus.log.includes('Everything OK') || snapraidStatus.log.includes('100% completed')) ? 'text-emerald-400' : 'text-amber-400'}`}>
+                      {snapraidStatus.log && (snapraidStatus.log.includes('Everything OK') || snapraidStatus.log.includes('100% completed')) ? '✓ PROTECTED' : '⚠️ SYNC RECOMMENDED'}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-slate-300">Hardware SMART</span>
+                    <span className={`text-sm font-bold ${disks.every(d => d.health === 'passed' || d.health === 'Unknown') ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {disks.every(d => d.health === 'passed' || d.health === 'Unknown') ? '✓ HEALTHY' : '⚠️ HARDWARE ALERT'}
+                    </span>
+                  </div>
+                </div>
+              </div>
               <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6">
                  <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider mb-4">Network Activity</h3>
                  <div className="flex justify-around">
@@ -427,7 +471,7 @@ function App() {
                               {isParity && <span className="text-[10px] uppercase tracking-wider bg-amber-500/20 text-amber-400 border border-amber-500/30 px-2 py-0.5 rounded-full">Parity</span>}
                             </h3>
                             <p className="text-sm text-slate-400 flex gap-3">
-                              <span>{disk.size}</span>
+                              <span>{formatBytes(disk.size)}</span>
                               <span>•</span>
                               <span>{disk.model || 'Unknown Model'}</span>
                               {disk.temperature && disk.temperature !== 'Unknown' && (
@@ -517,12 +561,36 @@ function App() {
                     {cronEnabled ? '✓ Daily Sync Enabled' : 'Enable Daily Sync'}
                   </button>
                   <button 
-                    onClick={handleSnapraidSync}
+                    onClick={() => handleSnapraidSync()}
                     disabled={snapraidStatus.running}
                     className="px-4 py-2 bg-indigo-500 hover:bg-indigo-600 disabled:bg-indigo-500/50 text-white rounded-lg text-sm font-medium transition-colors shadow-lg shadow-indigo-500/20"
                   >
                     {snapraidStatus.running ? 'Sync Running...' : 'Sync Now'}
                   </button>
+                  {!snapraidStatus.running && (
+                    <button 
+                      onClick={handleUndelete}
+                      className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded-lg text-sm font-medium transition-colors"
+                    >
+                      🩹 Undelete Files
+                    </button>
+                  )}
+                  {!snapraidStatus.running && snapraidStatus.log && snapraidStatus.log.includes('--force-empty') && (
+                    <button 
+                      onClick={() => handleSnapraidSync(true)}
+                      className="px-4 py-2 bg-rose-500 hover:bg-rose-600 text-white rounded-lg text-sm font-medium transition-colors shadow-lg shadow-rose-500/20"
+                    >
+                      ⚠️ Force Sync
+                    </button>
+                  )}
+                  {!snapraidStatus.running && snapraidStatus.log && snapraidStatus.log.includes('--force-full') && (
+                    <button 
+                      onClick={() => handleSnapraidSync(true, true)}
+                      className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-sm font-medium transition-colors shadow-lg shadow-rose-600/20"
+                    >
+                      🔥 Force Full Rebuild
+                    </button>
+                  )}
                 </div>
               </div>
               <div className="p-6 bg-slate-900/50">

@@ -28,10 +28,21 @@ app.use(express.static(path.join(__dirname, '../frontend/dist')));
  */
 async function rebuildMergerFsMount() {
     try {
-        const { stdout } = await execAsync(`findmnt -rn -t ext4 -o TARGET`);
-        const dataMounts = stdout.split('\n').filter(m => m.trim().startsWith('/mnt/disk_')).sort();
+        // Find all data disk mount points in fstab, excluding the pool itself
+        const fstab = await fs.readFile('/etc/fstab', 'utf8');
+        const dataMounts = fstab.split('\n')
+            .filter(line => {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith('#')) return false;
+                if (trimmed.includes('fuse.mergerfs') || trimmed.includes('/mnt/pool')) return false;
+                const fields = trimmed.split(/\s+/);
+                return fields[1]?.startsWith('/mnt/disk_');
+            })
+            .map(line => line.split(/\s+/)[1])
+            .filter(Boolean)
+            .sort();
 
-        // Remove old pool entry from fstab
+        // Remove old pool entry from fstab before rebuilding
         await execAsync(`sed -i '/\\/mnt\\/pool/d' /etc/fstab`);
 
         if (dataMounts.length === 0) {
@@ -42,15 +53,16 @@ async function rebuildMergerFsMount() {
         }
 
         const branches = dataMounts.join(':');
-        const entry = `${branches} /mnt/pool fuse.mergerfs defaults,allow_other,cache.files=partial,dropcacheonclose=true,category.create=mfs,minfreespace=10M,nofail 0 0`;
+        // Expert Flags: use_ino, moveonenospc, fsname
+        const entry = `${branches} /mnt/pool fuse.mergerfs defaults,allow_other,use_ino,cache.files=partial,dropcacheonclose=true,moveonenospc=true,category.create=mfs,minfreespace=10M,fsname=SimpleNAS_Pool,nofail 0 0`;
 
         // Write via temp file to avoid shell escaping issues
         await fs.writeFile('/tmp/pool_fstab_entry', entry + '\n');
         await execAsync(`cat /tmp/pool_fstab_entry >> /etc/fstab && rm /tmp/pool_fstab_entry`);
 
         // Ensure mount point exists and is empty
-        await execAsync(`mkdir -p /mnt/pool`);
         try { await execAsync(`umount -l /mnt/pool`); } catch (e) {}
+        await execAsync(`mkdir -p /mnt/pool`);
 
         // 5. MASK THE UNDERLYING FOLDER (Ghost Drive Protection)
         // We set it to 000 so if MergerFS is not mounted, Samba/Users see nothing.
@@ -89,8 +101,8 @@ async function generateSnapraidConfig() {
         const { stdout: findmntOut } = await execAsync('findmnt -rn -t ext4 -o TARGET');
         const activeMounts = findmntOut.split('\n').map(m => m.trim()).filter(Boolean);
 
-        const dataDisks = activeMounts.filter(m => m.startsWith('/mnt/disk_')).sort();
-        const parityMounts = activeMounts.filter(m => m.startsWith('/mnt/parity_')).sort();
+        const dataDisks = [...new Set(activeMounts.filter(m => m.startsWith('/mnt/disk_')))].sort();
+        const parityMounts = [...new Set(activeMounts.filter(m => m.startsWith('/mnt/parity_')))].sort();
         let parityDisks = parityMounts.map(m => `${m}/snapraid.parity`);
 
         // If no parity disks found, use existing ones (in case they are temporarily unmounted)
@@ -162,10 +174,22 @@ app.get('/api/disks', async (req, res) => {
         const data = JSON.parse(stdout);
         const blockDevices = data.blockdevices.filter(dev => dev.type === 'disk' && !dev.name.startsWith('loop') && !dev.name.startsWith('sr'));
 
-        const enhancedDisks = blockDevices.map(disk => ({
-            ...disk,
-            temperature: 'Unknown',
-            health: 'Unknown'
+        const enhancedDisks = await Promise.all(blockDevices.map(async (disk) => {
+            let health = 'Unknown';
+            let temp = 'Unknown';
+            try {
+                // M1: S.M.A.R.T. Monitoring
+                const { stdout: smart } = await execAsync(`smartctl -A -H -j /dev/${disk.name}`, { timeout: 2000 });
+                const smartData = JSON.parse(smart);
+                health = smartData.smart_status?.passed ? 'passed' : (smartData.smart_status ? 'FAILING' : 'Unknown');
+                temp = smartData.temperature?.current || 'Unknown';
+            } catch (e) { /* smartctl failed or not supported */ }
+
+            return {
+                ...disk,
+                temperature: temp,
+                health: health
+            };
         }));
 
         res.json({ success: true, disks: enhancedDisks });
@@ -228,7 +252,7 @@ app.post('/api/disks/format', async (req, res) => {
 
     try {
         // Safety check: Ensure it's not the OS drive
-        const { stdout: lsblkOut } = await execAsync(`lsblk -J -o NAME,MOUNTPOINTS ${devicePath}`);
+        const { stdout: lsblkOut } = await execAsync(`lsblk -J -o NAME,MOUNTPOINTS,SERIAL,LABEL ${devicePath}`);
         const data = JSON.parse(lsblkOut);
         const targetDisk = data.blockdevices[0];
 
@@ -242,6 +266,12 @@ app.post('/api/disks/format', async (req, res) => {
             return res.status(403).json({ success: false, error: 'Disk has mounted partitions. Unmount first.' });
         }
 
+        // H4: Safety check: Ensure it's not a parity drive
+        const label = targetDisk.children?.[0]?.label || '';
+        if (label.startsWith('parity_')) {
+            return res.status(403).json({ success: false, error: 'This drive is already configured as a Parity drive. You cannot add it to the Data pool without clearing it first.' });
+        }
+
         console.log(`Starting format of ${devicePath}...`);
 
         // 1. Partition and format
@@ -251,11 +281,12 @@ app.post('/api/disks/format', async (req, res) => {
         await execAsync(`mkfs.ext4 -F -L data_${disk} ${partitionPath}`);
         await execAsync(`tune2fs -m 0 ${partitionPath}`); // Remove reserved blocks to prevent Windows confusion
 
-        // 2. Get UUID and mount
+        // 2. Get UUID and Serial for persistent mounting
         const { stdout: uuidOut } = await execAsync(`blkid -s UUID -o value ${partitionPath}`);
         const uuid = uuidOut.trim();
-
-        const mountPoint = `/mnt/disk_${disk}`;
+        
+        // C1: Use Serial for persistent mount point name (Ghost Drive Elimination)
+        const mountPoint = `/mnt/disk_${targetDisk.serial || disk}`;
         await execAsync(`mkdir -p ${mountPoint}`);
 
         // 3. Add to fstab with nofail (remove old entry first)
@@ -294,7 +325,7 @@ app.post('/api/disks/parity', async (req, res) => {
     const partitionPath = `/dev/${disk}1`;
 
     try {
-        const { stdout: lsblkOut } = await execAsync(`lsblk -b -J -o NAME,SIZE,MOUNTPOINTS`);
+        const { stdout: lsblkOut } = await execAsync(`lsblk -b -J -o NAME,SIZE,MOUNTPOINTS,SERIAL,LABEL`);
         const blockdevices = JSON.parse(lsblkOut).blockdevices;
 
         const targetDrive = blockdevices.find(d => d.name === disk);
@@ -305,6 +336,12 @@ app.post('/api/disks/parity', async (req, res) => {
 
         const isMounted = targetDrive.children?.some(part => part.mountpoints?.length > 0 && part.mountpoints[0] !== null);
         if (isMounted) return res.status(403).json({ success: false, error: 'Disk is mounted. Unmount first.' });
+        
+        // H4: Safety check: Ensure it's not a data drive
+        const label = targetDrive.children?.[0]?.label || '';
+        if (label.startsWith('data_')) {
+            return res.status(403).json({ success: false, error: 'This drive is already configured as a Data drive. You cannot add it to Parity without clearing it first.' });
+        }
 
         // SnapRAID Rule: Parity must be >= largest data drive
         const paritySize = parseInt(targetDrive.size);
@@ -334,7 +371,8 @@ app.post('/api/disks/parity', async (req, res) => {
         const { stdout: uuidOut } = await execAsync(`blkid -s UUID -o value ${partitionPath}`);
         const uuid = uuidOut.trim();
 
-        const mountPoint = `/mnt/parity_${disk}`;
+        // C1: Use Serial for persistent mount point name
+        const mountPoint = `/mnt/parity_${targetDrive.serial || disk}`;
         await execAsync(`mkdir -p ${mountPoint}`);
 
         // Add to fstab with nofail
@@ -463,7 +501,6 @@ async function applySambaConfig(shareName, isPublic, password = null) {
    pam password change = yes
    usershare allow guests = yes
 `;
-
     let shareConfig = `
 [${shareName}]
    path = /mnt/pool
@@ -472,6 +509,8 @@ async function applySambaConfig(shareName, isPublic, password = null) {
    create mask = 0777
    directory mask = 0777
    force user = root
+   veto files = /snapraid.content/lost+found/
+   delete veto files = no
 `;
 
     if (isPublic) {
@@ -518,9 +557,31 @@ app.post('/api/shares/credentials', async (req, res) => {
 // ─── SnapRAID Management ───────────────────────────────────────────────────────
 
 app.post('/api/snapraid/sync', async (req, res) => {
+    const { force = false, full = false } = req.body;
     try {
-        await execAsync(`nohup snapraid sync > /var/log/snapraid_sync.log 2>&1 &`);
-        res.json({ success: true, message: 'SnapRAID sync started in the background.' });
+        // H2: Pre-sync mount verification
+        const config = await fs.readFile('/etc/snapraid.conf', 'utf8');
+        const configuredDisks = config.split('\n')
+            .filter(l => l.startsWith('disk '))
+            .map(l => l.split(/\s+/)[2]);
+
+        for (const mp of configuredDisks) {
+            try {
+                await execAsync(`mountpoint -q ${mp}`);
+            } catch (e) {
+                return res.status(400).json({
+                    success: false,
+                    error: `Safety Error: Drive at ${mp} is not mounted! Syncing now would risk your parity. Check your cables.`
+                });
+            }
+        }
+
+        let cmd = 'snapraid sync';
+        if (full) cmd = 'snapraid --force-empty --force-full sync';
+        else if (force) cmd = 'snapraid --force-empty sync';
+        
+        await execAsync(`nohup ${cmd} > /var/log/snapraid_sync.log 2>&1 &`);
+        res.json({ success: true, message: `SnapRAID sync started ${full ? '(FULL REBUILD)' : (force ? '(FORCED)' : '')} in the background.` });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -558,7 +619,29 @@ app.post('/api/snapraid/cron', async (req, res) => {
                 minute = parseInt(parts[1], 10);
             }
 
-            const cronScript = `#!/bin/bash\nsnapraid sync >> /var/log/snapraid_sync.log 2>&1\nsnapraid scrub >> /var/log/snapraid_sync.log 2>&1\n`;
+            const cronScript = `#!/bin/bash
+LOG="/var/log/snapraid_sync.log"
+# 1. Pre-flight: verify all configured disks are mounted
+MISSING=$(snapraid status 2>&1 | grep -c "WARNING! Disk")
+if [ "$MISSING" -gt 0 ]; then
+    echo "$(date) ABORTED: $MISSING disk(s) missing. Not syncing." >> $LOG
+    exit 1
+fi
+# 2. Dry-run to check delete threshold (50% safety valve)
+DELETED=$(snapraid diff 2>&1 | grep -oP '^\\s+\\K\\d+(?= removed)')
+THRESHOLD=50
+if [ "\${DELETED:-0}" -gt "$THRESHOLD" ]; then
+    echo "$(date) ABORTED: $DELETED files deleted (threshold: $THRESHOLD)." >> $LOG
+    exit 1
+fi
+# 3. Safe to sync
+snapraid sync >> $LOG 2>&1
+# 4. Weekly scrub (check 8% of data for bitrot on Sundays)
+DAY=$(date +%u)
+if [ "$DAY" -eq 7 ]; then
+    snapraid scrub -p 8 -o 30 >> $LOG 2>&1
+fi
+`;
             await fs.writeFile(scriptPath, cronScript, { mode: 0o755 });
 
             const cronJob = `${minute} ${hour} * * * root ${scriptPath}\n`;
@@ -566,7 +649,7 @@ app.post('/api/snapraid/cron', async (req, res) => {
 
             await execAsync(`rm -f /etc/cron.daily/simplenas-snapraid`);
 
-            res.json({ success: true, message: `Daily SnapRAID sync scheduled for ${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}.` });
+            res.json({ success: true, message: `Robust daily sync scheduled for ${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}.` });
         } else {
             await execAsync(`rm -f ${cronPath} ${scriptPath}`);
             res.json({ success: true, message: 'Automated SnapRAID sync disabled.' });
@@ -607,15 +690,35 @@ app.get('/api/snapraid/health', async (req, res) => {
 // SnapRAID Fix — rebuild data onto a replacement drive
 app.post('/api/snapraid/fix', async (req, res) => {
     const { missingDiskName, newDiskDevice } = req.body;
-
+ 
     if (!missingDiskName || !newDiskDevice || !newDiskDevice.match(/^[a-z0-9]+$/)) {
         return res.status(400).json({ success: false, error: 'Invalid parameters' });
     }
-
+ 
     const devicePath = `/dev/${newDiskDevice}`;
     const partitionPath = `/dev/${newDiskDevice}1`;
-
+ 
     try {
+        // C4: Size Validation
+        const { stdout: lsblkOut } = await execAsync(`lsblk -b -J -o NAME,SIZE,SERIAL`);
+        const blockdevices = JSON.parse(lsblkOut).blockdevices;
+        const newDisk = blockdevices.find(d => d.name === newDiskDevice);
+        
+        if (!newDisk) return res.status(400).json({ success: false, error: 'Replacement drive not found' });
+        
+        // Get the size of the largest existing parity file to estimate minimum required size
+        const { stdout: snapStatus } = await execAsync(`snapraid status`);
+        const sizeMatch = snapStatus.match(/(\d+) GiB of parity/);
+        if (sizeMatch) {
+            const requiredBytes = parseInt(sizeMatch[1]) * 1024 * 1024 * 1024;
+            if (parseInt(newDisk.size) < requiredBytes) {
+                return res.status(400).json({
+                    success: false, 
+                    error: `The replacement drive is too small. It must be at least ${sizeMatch[1]} GiB to fit the parity data.` 
+                });
+            }
+        }
+
         // Format the new disk
         await execAsync(`parted -s ${devicePath} mklabel gpt`);
         await execAsync(`parted -s ${devicePath} mkpart primary ext4 0% 100%`);
@@ -656,6 +759,16 @@ app.post('/api/snapraid/fix', async (req, res) => {
         res.json({ success: true, message: `Recovery started! Rebuilding data onto ${newDiskDevice}.` });
     } catch (error) {
         console.error('Error starting fix:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// M3: Undelete Capability
+app.post('/api/snapraid/undelete', async (req, res) => {
+    try {
+        await execAsync(`nohup snapraid fix -m > /var/log/snapraid_sync.log 2>&1 &`);
+        res.json({ success: true, message: 'Recovery of deleted files started in the background!' });
+    } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
