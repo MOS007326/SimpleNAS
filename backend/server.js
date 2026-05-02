@@ -456,17 +456,22 @@ app.post('/api/disks/remove', async (req, res) => {
             return res.status(400).json({ success: false, error: `Drive ${disk} is not currently mounted.` });
         }
 
-        if (!mountPoint.startsWith('/mnt/disk_')) {
-             return res.status(400).json({ success: false, error: `Drive ${disk} is mounted at ${mountPoint}, which is not a managed data pool path.` });
+        const isData = mountPoint.startsWith('/mnt/disk_');
+        const isParity = mountPoint.startsWith('/mnt/parity_');
+
+        if (!isData && !isParity) {
+             return res.status(400).json({ success: false, error: `Drive ${disk} is mounted at ${mountPoint}, which is not a managed SimpleNAS path.` });
         }
 
-        // 2. Find SnapRAID disk name (d1, d2, etc.) from config
+        // 2. Find SnapRAID disk name (d1, d2, etc.) if it's a data disk
         let snapraidDiskName = null;
-        try {
-            const config = await fs.readFile('/etc/snapraid.conf', 'utf8');
-            const match = config.match(new RegExp(`^disk\\s+(d\\d+)\\s+${mountPoint.replace(/\//g, '\\/')}`, 'm'));
-            if (match) snapraidDiskName = match[1];
-        } catch (e) {}
+        if (isData) {
+            try {
+                const config = await fs.readFile('/etc/snapraid.conf', 'utf8');
+                const match = config.match(new RegExp(`^disk\\s+(d\\d+)\\s+${mountPoint.replace(/\//g, '\\/')}`, 'm'));
+                if (match) snapraidDiskName = match[1];
+            } catch (e) {}
+        }
 
         // 3. Unmount the drive
         await execAsync(`umount -l ${mountPoint}`);
@@ -475,13 +480,16 @@ app.post('/api/disks/remove', async (req, res) => {
         // 4. Remove fstab entry for this drive
         await execAsync(`sed -i '\\|${mountPoint}|d' /etc/fstab`);
 
-        // 5. Rebuild pool without this drive
-        await rebuildMergerFsMount();
+        // 5. Update system configurations
+        if (isData) {
+            await rebuildMergerFsMount();
+        }
+        await generateSnapraidConfig();
 
-        console.log(`Removed ${disk} from pool (SnapRAID name: ${snapraidDiskName})`);
+        console.log(`Removed ${isData ? 'Data' : 'Parity'} drive ${disk} from system.`);
         res.json({
             success: true,
-            message: `Drive ${disk} removed from pool. You can now physically replace it.`,
+            message: `Drive ${disk} (${isData ? 'Data' : 'Parity'}) removed. You can now physically replace it.`,
             snapraidDiskName
         });
 
@@ -708,8 +716,15 @@ app.get('/api/snapraid/health', async (req, res) => {
         }
 
         const missingDisks = [];
+        let parityCount = 0;
         const lines = existingConfig.split('\n');
         for (const line of lines) {
+            // Count parity drives
+            if (line.match(/^([2-6]-)?parity\s+/)) {
+                parityCount++;
+            }
+
+            // Check for missing data disks
             const match = line.match(/^disk\s+(d[0-9]+)\s+(.+)$/);
             if (match) {
                 const diskName = match[1];
@@ -721,7 +736,9 @@ app.get('/api/snapraid/health', async (req, res) => {
                 }
             }
         }
-        res.json({ success: true, missingDisks });
+        
+        const isRecoverable = missingDisks.length <= parityCount;
+        res.json({ success: true, missingDisks, parityCount, isRecoverable });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }

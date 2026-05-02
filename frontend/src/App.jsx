@@ -14,6 +14,8 @@ function App() {
   const [cronTime, setCronTime] = useState('02:00');
 
   const [missingDisks, setMissingDisks] = useState([]);
+  const [isRecoverable, setIsRecoverable] = useState(true);
+  const [parityCount, setParityCount] = useState(0);
   const [recoveryModalOpen, setRecoveryModalOpen] = useState(false);
   const [selectedMissingDisk, setSelectedMissingDisk] = useState('');
   const [selectedReplacementDisk, setSelectedReplacementDisk] = useState('');
@@ -77,6 +79,8 @@ function App() {
       const healthData = await healthRes.json();
       if (healthData.success) {
         setMissingDisks(healthData.missingDisks);
+        setParityCount(healthData.parityCount);
+        setIsRecoverable(healthData.isRecoverable);
       }
     } catch (error) {
       console.error("Failed to fetch disks", error);
@@ -244,8 +248,12 @@ function App() {
     }
   };
 
-  const handleRemoveFromPool = async (diskName) => {
-    if (!window.confirm(`Remove ${diskName} from the pool?\n\nThe drive will be unmounted. You can then physically swap it and rebuild from parity.`)) return;
+  const handleRemoveFromPool = async (diskName, isParity = false) => {
+    const message = isParity 
+      ? `Remove Parity drive ${diskName}?\n\nWarning: Your data will be safe, but it will be unprotected until you add a new parity drive and complete a sync.`
+      : `Remove Data drive ${diskName} from the pool?\n\nThe drive will be unmounted. You can then physically swap it and rebuild its data from parity.`;
+    
+    if (!window.confirm(message)) return;
     setLoading(true);
     try {
       const res = await fetch('/api/disks/remove', {
@@ -306,6 +314,22 @@ function App() {
               <h2 className="text-2xl font-bold tracking-tight">System Overview</h2>
               <p className="text-slate-400 mt-1">Real-time health and storage metrics.</p>
             </div>
+
+            {missingDisks.length > 0 && (
+              <div className={`p-4 rounded-xl border ${isRecoverable ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-rose-500/10 border-rose-500/30 text-rose-400'} animate-pulse`}>
+                <div className="flex items-center gap-3">
+                  <span className="text-2xl">{isRecoverable ? '⚠️' : '🚨'}</span>
+                  <div>
+                    <h4 className="font-bold">{isRecoverable ? 'Drive Failure Detected' : 'CRITICAL: Unrecoverable Failure'}</h4>
+                    <p className="text-sm opacity-90">
+                      {isRecoverable 
+                        ? `${missingDisks.length} drive(s) are missing, but your data is safe. Go to the Storage tab to rebuild.`
+                        : `Critical Error: ${missingDisks.length} drives are missing with only ${parityCount} parity drive(s). Some data on the failed drives is lost, but the rest of your pool remains safe.`}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6 backdrop-blur-sm">
                 <h3 className="text-sm font-medium text-slate-400 uppercase tracking-wider">CPU Usage</h3>
@@ -517,9 +541,17 @@ function App() {
                                </button>
                              </div>
                           ) : isParity ? (
-                             <button disabled className="px-4 py-2 bg-amber-500/5 text-amber-500/50 border border-amber-500/10 rounded-lg text-sm font-medium cursor-not-allowed flex items-center gap-2">
-                                Parity Drive
-                             </button>
+                              <div className="flex gap-2">
+                                <button disabled className="px-4 py-2 bg-amber-500/5 text-amber-500/50 border border-amber-500/10 rounded-lg text-sm font-medium cursor-not-allowed flex items-center gap-2">
+                                  Parity Drive
+                                </button>
+                                <button
+                                  onClick={() => handleRemoveFromPool(disk.name, true)}
+                                  className="px-4 py-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/30 rounded-lg text-sm font-medium transition-colors"
+                                >
+                                  Remove
+                                </button>
+                              </div>
                           ) : (
                             <>
                               <button 
@@ -626,6 +658,14 @@ function App() {
                 <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-lg shadow-2xl p-6">
                   <h3 className="text-xl font-bold text-rose-400 mb-2">Disaster Recovery Wizard</h3>
                   <p className="text-sm text-slate-400 mb-6">Select the missing drive you want to rebuild, and choose an empty replacement drive to restore the data onto.</p>
+                  
+                  {!isRecoverable && (
+                    <div className="mb-6 p-4 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-400 text-sm">
+                      <p className="font-bold mb-1">🚨 Warning: Unrecoverable Scenario</p>
+                      <p>You have {missingDisks.length} failed drives but only {parityCount} parity drive(s). You can only recover {parityCount} drive(s) total. Some files on the missing drives are permanently lost.</p>
+                      <p className="mt-2 text-slate-400 italic">Note: Files on your healthy pool drives are still safe and accessible.</p>
+                    </div>
+                  )}
                   
                   <div className="space-y-4">
                     <div>

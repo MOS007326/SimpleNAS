@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# SimpleNAS v3.3.5 Automated Installer
+# SimpleNAS v3.4.0 Automated Installer
 # Supported OS: Debian 13 (Trixie), Ubuntu 24.04+
 
 set -e
@@ -66,7 +66,7 @@ systemctl restart simplenas
 IP_ADDR=$(hostname -I | awk '{print $1}')
 echo ""
 echo "#########################################################"
-echo "🎉 SimpleNAS v3.3.5 Installation Complete!"
+echo "🎉 SimpleNAS v3.4.0 Installation Complete!"
 echo "#########################################################"
 echo ""
 echo "You can access your NAS dashboard at:"
