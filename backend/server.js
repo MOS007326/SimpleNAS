@@ -124,25 +124,30 @@ async function generateSnapraidConfig() {
         const finalDisks = {};
         const unassignedMounts = [];
 
+        // 1. First, keep all existing data disks (even if unmounted!)
+        // This ensures SnapRAID knows they are missing rather than deleted.
+        for (const [key, path] of Object.entries(existingDisks)) {
+            finalDisks[key] = path;
+        }
+
+        // 2. Identify new mounts that aren't in the config yet
         dataDisks.forEach(mount => {
-            let foundKey = null;
-            for (const [key, path] of Object.entries(existingDisks)) {
+            let alreadyConfigured = false;
+            for (const path of Object.values(finalDisks)) {
                 if (path === mount) {
-                    foundKey = key;
+                    alreadyConfigured = true;
                     break;
                 }
             }
-            if (foundKey) {
-                finalDisks[foundKey] = mount;
-            } else {
+            if (!alreadyConfigured) {
                 unassignedMounts.push(mount);
             }
         });
 
-        // Assign new d-numbers to new mounts
+        // 3. Assign new d-numbers to new mounts
         let nextDiskNum = 1;
         unassignedMounts.forEach(mount => {
-            while (finalDisks[`d${nextDiskNum}`] || existingDisks[`d${nextDiskNum}`]) {
+            while (finalDisks[`d${nextDiskNum}`]) {
                 nextDiskNum++;
             }
             finalDisks[`d${nextDiskNum}`] = mount;
@@ -483,8 +488,13 @@ app.post('/api/disks/remove', async (req, res) => {
         // 5. Update system configurations
         if (isData) {
             await rebuildMergerFsMount();
+            // DO NOT call generateSnapraidConfig here. 
+            // We want the drive to stay in snapraid.conf but be unmounted 
+            // so SnapRAID detects it as 'missing' for recovery.
+        } else if (isParity) {
+            await generateSnapraidConfig(); 
+            // We DO want to update config for parity swap/removal.
         }
-        await generateSnapraidConfig();
 
         console.log(`Removed ${isData ? 'Data' : 'Parity'} drive ${disk} from system.`);
         res.json({
