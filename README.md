@@ -1,4 +1,4 @@
-# 🏠 SimpleNAS v3.4.0
+# 🏠 SimpleNAS v3.4.2
 
 SimpleNAS is a "Granny-friendly" storage appliance built on top of Debian. It provides a modern, responsive web interface to manage **MergerFS** (pooling) and **SnapRAID** (parity protection) with zero command-line interaction required after setup.
 

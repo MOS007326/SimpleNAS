@@ -633,10 +633,13 @@ app.post('/api/snapraid/sync', async (req, res) => {
             }
         }
 
-        let cmd = 'snapraid sync';
-        if (full) cmd = 'snapraid --force-empty --force-full sync';
-        else if (forceUuid) cmd = 'snapraid --force-uuid sync';
-        else if (force) cmd = 'snapraid --force-empty sync';
+        let cmd = 'snapraid';
+        if (full) cmd += ' --force-empty --force-full';
+        else if (force) cmd += ' --force-empty';
+        
+        if (forceUuid || full || force) cmd += ' --force-uuid';
+        
+        cmd += ' sync';
         
         await execAsync(`nohup ${cmd} > /var/log/snapraid_sync.log 2>&1 &`);
         res.json({ success: true, message: `SnapRAID sync started ${full ? '(FULL REBUILD)' : (force ? '(FORCED)' : '')} in the background.` });
