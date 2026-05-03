@@ -65,8 +65,9 @@ async function rebuildMergerFsMount() {
         }
 
         const branches = dataMounts.join(':');
-        // Expert Flags: use_ino, moveonenospc, fsname
-        const entry = `${branches} /mnt/pool fuse.mergerfs defaults,allow_other,use_ino,cache.files=partial,dropcacheonclose=true,moveonenospc=true,category.create=mfs,minfreespace=10M,fsname=SimpleNAS_Pool,nofail 0 0`;
+        // Granny-Proof Flags: disable caching to ensure live visibility of SnapRAID recoveries.
+        // entry_timeout=0 and attr_timeout=0 ensure MergerFS always checks the disks directly.
+        const entry = `${branches} /mnt/pool fuse.mergerfs defaults,allow_other,use_ino,cache.files=off,entry_timeout=0,attr_timeout=0,dropcacheonclose=true,moveonenospc=true,category.create=mfs,minfreespace=10M,fsname=SimpleNAS_Pool,nofail 0 0`;
 
         // Write via temp file to avoid shell escaping issues
         await fs.writeFile('/tmp/pool_fstab_entry', entry + '\n');
@@ -850,8 +851,8 @@ app.post('/api/snapraid/fix', async (req, res) => {
         });
         await fs.writeFile('/etc/snapraid.conf', newLines.join('\n'), 'utf8');
 
-        // Start the fix process in the background with force flags and refresh pulse
-        const fixCmd = `snapraid fix -d ${missingDiskName} --force-uuid --force-device && find /mnt/pool -maxdepth 3 > /dev/null`;
+        // Start the fix process in the background with force flags, permission sweep, and remount
+        const fixCmd = `snapraid fix -d ${missingDiskName} --force-uuid --force-device && chown -R root:root /mnt/pool && chmod -R 777 /mnt/pool && umount -l /mnt/pool && mount /mnt/pool`;
         await execAsync(`nohup bash -c "${fixCmd}" > /var/log/snapraid_sync.log 2>&1 &`);
 
         res.json({ success: true, message: `Recovery started! Rebuilding data onto ${newDiskDevice}.` });
@@ -864,8 +865,8 @@ app.post('/api/snapraid/fix', async (req, res) => {
 // M3: Undelete Capability
 app.post('/api/snapraid/undelete', async (req, res) => {
     try {
-        // We chain a 'refresh' command to ensure MergerFS sees the restored files
-        const cmd = `snapraid fix -m && find /mnt/pool -maxdepth 3 > /dev/null`;
+        // We chain permissions and remount to ensure everything is visible and accessible
+        const cmd = `snapraid fix -m && chown -R root:root /mnt/pool && chmod -R 777 /mnt/pool && umount -l /mnt/pool && mount /mnt/pool`;
         await execAsync(`nohup bash -c "${cmd}" > /var/log/snapraid_sync.log 2>&1 &`);
         res.json({ success: true, message: 'Recovery of deleted files started in the background!' });
     } catch (error) {
