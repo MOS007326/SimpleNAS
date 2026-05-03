@@ -850,8 +850,9 @@ app.post('/api/snapraid/fix', async (req, res) => {
         });
         await fs.writeFile('/etc/snapraid.conf', newLines.join('\n'), 'utf8');
 
-        // Start the fix process in the background with force flags
-        await execAsync(`nohup snapraid fix -d ${missingDiskName} --force-uuid --force-device > /var/log/snapraid_sync.log 2>&1 &`);
+        // Start the fix process in the background with force flags and refresh pulse
+        const fixCmd = `snapraid fix -d ${missingDiskName} --force-uuid --force-device && find /mnt/pool -maxdepth 3 > /dev/null`;
+        await execAsync(`nohup bash -c "${fixCmd}" > /var/log/snapraid_sync.log 2>&1 &`);
 
         res.json({ success: true, message: `Recovery started! Rebuilding data onto ${newDiskDevice}.` });
     } catch (error) {
@@ -863,7 +864,9 @@ app.post('/api/snapraid/fix', async (req, res) => {
 // M3: Undelete Capability
 app.post('/api/snapraid/undelete', async (req, res) => {
     try {
-        await execAsync(`nohup snapraid fix -m > /var/log/snapraid_sync.log 2>&1 &`);
+        // We chain a 'refresh' command to ensure MergerFS sees the restored files
+        const cmd = `snapraid fix -m && find /mnt/pool -maxdepth 3 > /dev/null`;
+        await execAsync(`nohup bash -c "${cmd}" > /var/log/snapraid_sync.log 2>&1 &`);
         res.json({ success: true, message: 'Recovery of deleted files started in the background!' });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
