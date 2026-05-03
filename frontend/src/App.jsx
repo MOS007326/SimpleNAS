@@ -9,7 +9,7 @@ function App() {
   const [sysStats, setSysStats] = useState(null);
   const [storageStats, setStorageStats] = useState(null);
   
-  const [snapraidStatus, setSnapraidStatus] = useState({ running: false, log: '', progress: 0 });
+  const [snapraidStatus, setSnapraidStatus] = useState({ running: false, log: '', progress: 0, inSync: true });
   const [cronEnabled, setCronEnabled] = useState(false);
   const [cronTime, setCronTime] = useState('02:00');
 
@@ -93,7 +93,12 @@ function App() {
       const res = await fetch(`/api/snapraid/status`);
       const data = await res.json();
       if (data.success) {
-        setSnapraidStatus({ running: data.running, log: data.log });
+        setSnapraidStatus({ 
+          running: data.running, 
+          log: data.log, 
+          progress: data.progress, 
+          inSync: data.inSync 
+        });
       }
     } catch (error) {
       console.error("Failed to fetch SnapRAID status", error);
@@ -385,8 +390,8 @@ function App() {
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-slate-300">Parity Status</span>
-                    <span className={`text-sm font-bold ${snapraidStatus.log && (snapraidStatus.log.includes('Everything OK') || snapraidStatus.log.includes('100% completed')) ? 'text-emerald-400' : 'text-amber-400'}`}>
-                      {snapraidStatus.log && (snapraidStatus.log.includes('Everything OK') || snapraidStatus.log.includes('100% completed')) ? '✓ PROTECTED' : '⚠️ SYNC RECOMMENDED'}
+                    <span className={`text-sm font-bold ${snapraidStatus.inSync ? 'text-emerald-400' : 'text-amber-400'}`}>
+                      {snapraidStatus.inSync ? '✓ PROTECTED' : '⚠️ SYNC RECOMMENDED'}
                     </span>
                   </div>
                   <div className="flex items-center justify-between">

@@ -650,18 +650,45 @@ app.post('/api/snapraid/sync', async (req, res) => {
 
 app.get('/api/snapraid/status', async (req, res) => {
     try {
-        const { stdout } = await execAsync(`tail -n 50 /var/log/snapraid_sync.log || echo "No sync log found."`);
+        // 1. Check if SnapRAID is currently running
+        const { stdout: isRunningStr } = await execAsync(`pgrep snapraid || echo ""`);
+        const running = isRunningStr.trim().length > 0;
 
+        // 2. Read the last sync log (more lines for safety)
+        const { stdout: logContent } = await execAsync(`tail -n 500 /var/log/snapraid_sync.log || echo "No sync log found."`);
+
+        // 3. Calculate progress if running
         let progress = 0;
-        const matches = stdout.match(/(\d+)%/g);
+        const matches = logContent.match(/(\d+)%/g);
         if (matches) {
             progress = parseInt(matches[matches.length - 1]);
         }
 
-        const { stdout: isRunning } = await execAsync(`pgrep snapraid || echo ""`);
-        res.json({ success: true, log: stdout, running: isRunning.trim().length > 0, progress });
+        // 4. Perform a live 'diff' check if NOT running to see if sync is ACTUALLY needed
+        // Exit code 0 = No changes, 2 = Changes detected.
+        let inSync = false;
+        if (!running) {
+            try {
+                await execAsync('snapraid diff');
+                inSync = true; // Exit code 0
+            } catch (e) {
+                // Exit code 2 or other error means not in sync
+                inSync = false;
+            }
+        } else {
+            // If running, we check if the log ALREADY says Everything OK (unlikely if running but safe)
+            inSync = logContent.includes('Everything OK') || logContent.includes('100% completed');
+        }
+
+        res.json({ 
+            success: true, 
+            log: logContent, 
+            running, 
+            progress,
+            inSync 
+        });
     } catch (error) {
-        res.json({ success: true, log: 'No sync has been run yet.', running: false, progress: 0 });
+        res.json({ success: true, log: 'Error fetching status', running: false, progress: 0, inSync: false });
     }
 });
 
